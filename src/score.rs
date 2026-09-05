@@ -44,6 +44,14 @@ pub(crate) fn find_either(haystack: &[u8], first: u8, second: u8) -> Option<usiz
 pub fn has_match(needle: &[u8], mut haystack: &[u8]) -> bool {
     for &byte in needle {
         let uppercase = byte.to_ascii_uppercase();
+        // Contiguous query prefixes are common. This uses the same accepted
+        // byte pair as `find_either`, without setting up its word scan.
+        if let Some((&first, rest)) = haystack.split_first()
+            && (first == byte || first == uppercase)
+        {
+            haystack = rest;
+            continue;
+        }
         let Some(position) = find_either(haystack, byte, uppercase) else {
             return false;
         };
@@ -86,12 +94,13 @@ struct Score {
 #[inline]
 fn lowercase(byte: u8) -> u8 { byte.to_ascii_lowercase() }
 
-// Upstream's native C build fuses this expression on ARM (and x86 with FMA).
-// Preserving that rounding matters for ordering scores separated by one ULP.
+// The reference macOS Clang build fuses this expression when FMA is available;
+// the Linux GCC build with upstream's -std=c99 flags rounds it twice. Keep
+// those defaults: one ULP can change the order of otherwise equal matches.
 fn initial_score(column: usize, bonus: f64) -> f64 {
-    #[cfg(any(target_arch = "aarch64", target_feature = "fma"))]
+    #[cfg(all(target_os = "macos", any(target_arch = "aarch64", target_feature = "fma")))]
     { (column as f64).mul_add(GAP_LEADING, bonus) }
-    #[cfg(not(any(target_arch = "aarch64", target_feature = "fma")))]
+    #[cfg(not(all(target_os = "macos", any(target_arch = "aarch64", target_feature = "fma"))))]
     { column as f64 * GAP_LEADING + bonus }
 }
 
@@ -154,12 +163,17 @@ fn score_rows(
     let mut best = f64::NEG_INFINITY;
 
     for j in 0..width {
-        let ending = if first_byte == workspace.lowercase_haystack[j] {
-            initial_score(j, bonus_score(workspace.bonus_codes[j]))
+        let ending;
+        if first_byte == workspace.lowercase_haystack[j] {
+            ending = initial_score(j, bonus_score(workspace.bonus_codes[j]));
+            best = ending.max(best + first_gap);
         } else {
-            f64::NEG_INFINITY
-        };
-        best = ending.max(best + first_gap);
+            ending = f64::NEG_INFINITY;
+            // Scores are finite or -infinity, so this is exactly
+            // `max(-infinity, best + first_gap)`. It follows fzy's mismatch
+            // path without a floating-point maximum.
+            best += first_gap;
+        }
         workspace.ending[j] = ending;
         workspace.best[j] = best;
         record(Score { ending, best }, false);
@@ -174,12 +188,15 @@ fn score_rows(
         for j in 0..width {
             let previous_ending = workspace.ending[j];
             let previous_best = workspace.best[j];
-            let ending = if byte == workspace.lowercase_haystack[j] && j > 0 {
-                (diagonal_best + bonus_score(workspace.bonus_codes[j])).max(diagonal_ending + CONSECUTIVE)
+            let ending;
+            if byte == workspace.lowercase_haystack[j] && j > 0 {
+                ending = (diagonal_best + bonus_score(workspace.bonus_codes[j])).max(diagonal_ending + CONSECUTIVE);
+                best = ending.max(best + gap);
             } else {
-                f64::NEG_INFINITY
-            };
-            best = ending.max(best + gap);
+                ending = f64::NEG_INFINITY;
+                // As above, the impossible ending state cannot improve best.
+                best += gap;
+            }
             workspace.ending[j] = ending;
             workspace.best[j] = best;
             record(Score { ending, best }, j > 0 && best == diagonal_ending + CONSECUTIVE);

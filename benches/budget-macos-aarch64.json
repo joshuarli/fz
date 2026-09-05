@@ -1,0 +1,42 @@
+{
+  "schema": 1,
+  "host": "macos-aarch64-8-8gb",
+  "platform": "macos",
+  "arch": "aarch64",
+  "mode": "normal",
+  "warmup_runs": 1,
+  "measured_runs": 3,
+  "sample_count": null,
+  "sample_size": null,
+  "wall_ns": 2882896666,
+  "warmup_wall_ns": 727721625,
+  "measured_wall_ns": 2155175041,
+  "suite_wall_ns": [735420625, 712882583, 706871833],
+  "budget_mode": "accepted",
+  "budget_basis": {
+    "time": "ceil(observed_median_ns * 1.10)",
+    "allocations": "observed exact values",
+    "source": "target/perf/rustybench-final-observed.json"
+  },
+  "benchmarks": [
+    {"name": "bench::candidates_parse_long_boundary", "median_ns": 14988, "alloc_count": 1, "alloc_bytes": 12012, "max_alloc_count": 1, "max_alloc_bytes": 12012, "run_median_ns": [13937, 13583, 13625], "observed_median_ns": 13625},
+    {"name": "bench::candidates_parse_numeric_100k", "median_ns": 571587, "alloc_count": 1, "alloc_bytes": 50004, "max_alloc_count": 1, "max_alloc_bytes": 400032, "run_median_ns": [534729, 519124, 519624], "observed_median_ns": 519624},
+    {"name": "bench::candidates_parse_paths_100k", "median_ns": 948383, "alloc_count": 1, "alloc_bytes": 369764, "max_alloc_count": 1, "max_alloc_bytes": 739528, "run_median_ns": [890000, 858583, 862166], "observed_median_ns": 862166},
+    {"name": "bench::candidates_parse_small", "median_ns": 1260, "alloc_count": 1, "alloc_bytes": 480, "max_alloc_count": 1, "max_alloc_bytes": 960, "run_median_ns": [1166, 1125, 1145], "observed_median_ns": 1145},
+    {"name": "bench::choices_interactive_paths_100k_refinement_and_edit_default_parallel", "median_ns": 15141020, "alloc_count": 13, "alloc_bytes": 1600576, "max_alloc_count": 13, "max_alloc_bytes": 1600576, "run_median_ns": [16326187, 13764563, 13757104], "observed_median_ns": 13764563},
+    {"name": "bench::choices_search_dense_paths_100k_default_parallel", "median_ns": 10652835, "alloc_count": 13, "alloc_bytes": 1600580, "max_alloc_count": 13, "max_alloc_bytes": 1600580, "run_median_ns": [9691250, 9684395, 9675083], "observed_median_ns": 9684395},
+    {"name": "bench::choices_search_long_boundary", "median_ns": 1856388, "alloc_count": 2, "alloc_bytes": 2075, "max_alloc_count": 2, "max_alloc_bytes": 2075, "run_median_ns": [1744979, 1682625, 1687625], "observed_median_ns": 1687625},
+    {"name": "bench::choices_search_numeric_100k_dense", "median_ns": 2454924, "alloc_count": 2, "alloc_bytes": 1600008, "max_alloc_count": 2, "max_alloc_bytes": 1600008, "run_median_ns": [2231749, 2339541, 2230291], "observed_median_ns": 2231749},
+    {"name": "bench::choices_search_numeric_100k_selective", "median_ns": 1172622, "alloc_count": 2, "alloc_bytes": 1600008, "max_alloc_count": 2, "max_alloc_bytes": 1600008, "run_median_ns": [1066020, 1100583, 1046000], "observed_median_ns": 1066020},
+    {"name": "bench::choices_search_paths_100k_dense", "median_ns": 16157602, "alloc_count": 2, "alloc_bytes": 1600008, "max_alloc_count": 2, "max_alloc_bytes": 1600008, "run_median_ns": [14707187, 14688729, 14658333], "observed_median_ns": 14688729},
+    {"name": "bench::choices_search_paths_100k_no_match", "median_ns": 1414921, "alloc_count": 2, "alloc_bytes": 1600009, "max_alloc_count": 2, "max_alloc_bytes": 1600009, "run_median_ns": [1286291, 1287729, 1281708], "observed_median_ns": 1286291},
+    {"name": "bench::choices_search_paths_100k_selective", "median_ns": 4091749, "alloc_count": 2, "alloc_bytes": 1600012, "max_alloc_count": 2, "max_alloc_bytes": 1600012, "run_median_ns": [3719771, 3740958, 3713271], "observed_median_ns": 3719771},
+    {"name": "bench::has_match_long_1024", "median_ns": 38, "alloc_count": 0, "alloc_bytes": 0, "max_alloc_count": 0, "max_alloc_bytes": 0, "run_median_ns": [34, 34, 34], "observed_median_ns": 34},
+    {"name": "bench::has_match_selective_path", "median_ns": 11, "alloc_count": 0, "alloc_bytes": 0, "max_alloc_count": 0, "max_alloc_bytes": 0, "run_median_ns": [10, 10, 10], "observed_median_ns": 10},
+    {"name": "bench::positions_long_1024", "median_ns": 40747, "alloc_count": 2, "alloc_bytes": 27864, "max_alloc_count": 2, "max_alloc_bytes": 27864, "run_median_ns": [37042, 37041, 37083], "observed_median_ns": 37042},
+    {"name": "bench::positions_selective_path", "median_ns": 1180, "alloc_count": 2, "alloc_bytes": 576, "max_alloc_count": 1, "max_alloc_bytes": 216, "run_median_ns": [1062, 1072, 1073], "observed_median_ns": 1072},
+    {"name": "bench::score_long_1024", "median_ns": 28875, "alloc_count": 0, "alloc_bytes": 0, "max_alloc_count": 0, "max_alloc_bytes": 0, "run_median_ns": [26250, 26250, 26250], "observed_median_ns": 26250},
+    {"name": "bench::score_over_1024_bypass", "median_ns": 2, "alloc_count": 0, "alloc_bytes": 0, "max_alloc_count": 0, "max_alloc_bytes": 0, "run_median_ns": [1, 1, 1], "observed_median_ns": 1},
+    {"name": "bench::score_selective_path", "median_ns": 768, "alloc_count": 0, "alloc_bytes": 0, "max_alloc_count": 0, "max_alloc_bytes": 0, "run_median_ns": [692, 698, 698], "observed_median_ns": 698}
+  ]
+}

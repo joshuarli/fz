@@ -1,16 +1,17 @@
+use std::borrow::Cow;
 use std::ffi::OsString;
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 mod terminal;
 
 struct Options {
     lines: usize,
-    prompt: Vec<u8>,
+    prompt: Cow<'static, [u8]>,
     query: Vec<u8>,
-    tty: PathBuf,
+    tty: Cow<'static, Path>,
     show_scores: bool,
     show_info: bool,
     filter: Option<Vec<u8>>,
@@ -35,8 +36,8 @@ const HELP: &str = "Usage: fz [OPTION]...
 impl Options {
     fn parse() -> Result<Option<Self>, String> {
         let mut options = Self {
-            lines: 10, prompt: b"> ".to_vec(), query: Vec::new(),
-            tty: PathBuf::from("/dev/tty"), show_scores: false, show_info: false,
+            lines: 10, prompt: Cow::Borrowed(b"> "), query: Vec::new(),
+            tty: Cow::Borrowed(Path::new("/dev/tty")), show_scores: false, show_info: false,
             filter: None, delimiter: b'\n', workers: 0,
         };
         let mut args = std::env::args_os().skip(1).map(OsString::into_vec);
@@ -48,43 +49,44 @@ impl Options {
             if !arg.starts_with(b"-") || arg == b"-" {
                 return Err("Unexpected positional argument".into());
             }
+            let long_key;
             let (keys, attached) = if let Some(long) = arg.strip_prefix(b"--") {
                 let end = long.iter().position(|&ch| ch == b'=').unwrap_or(long.len());
-                let key = match &long[..end] {
+                long_key = match &long[..end] {
                     b"lines" => b'l', b"prompt" => b'p', b"query" => b'q',
                     b"show-matches" => b'e', b"tty" => b't', b"show-scores" => b's',
                     b"read-null" => b'0', b"workers" => b'j', b"show-info" => b'i',
                     b"help" => b'h', b"version" => b'v', _ => b'?',
                 };
-                (vec![key], (end < long.len()).then(|| long[end + 1..].to_vec()))
+                (&[long_key][..], (end < long.len()).then(|| &long[end + 1..]))
             } else {
-                (arg[1..].to_vec(), None)
+                (&arg[1..], None)
             };
             for (index, &key) in keys.iter().enumerate() {
                 if b"lpqetj".contains(&key) {
-                    let value = if let Some(value) = attached.clone() {
-                        value
+                    let value: Cow<'_, [u8]> = if let Some(value) = attached {
+                        Cow::Borrowed(value)
                     } else if index + 1 < keys.len() {
-                        keys[index + 1..].to_vec()
+                        Cow::Borrowed(&keys[index + 1..])
                     } else if let Some(value) = args.next() {
-                        value
+                        Cow::Owned(value)
                     } else {
                         eprint!("{HELP}");
                         return Ok(None);
                     };
                     match key {
                         b'l' => {
-                            options.lines = if value == b"max" { usize::MAX } else {
-                                std::str::from_utf8(&value).ok().and_then(|s| s.parse().ok())
+                            options.lines = if value.as_ref() == b"max" { usize::MAX } else {
+                                std::str::from_utf8(value.as_ref()).ok().and_then(|s| s.parse().ok())
                                     .filter(|&n| n >= 3).ok_or("--lines must be an integer >= 3 or max")?
                             };
                         }
-                        b'p' => options.prompt = value,
-                        b'q' => options.query = value,
-                        b'e' => options.filter = Some(value),
-                        b't' => options.tty = PathBuf::from(OsString::from_vec(value)),
+                        b'p' => options.prompt = Cow::Owned(value.into_owned()),
+                        b'q' => options.query = value.into_owned(),
+                        b'e' => options.filter = Some(value.into_owned()),
+                        b't' => options.tty = Cow::Owned(PathBuf::from(OsString::from_vec(value.into_owned()))),
                         b'j' => {
-                            options.workers = std::str::from_utf8(&value).ok().and_then(|s| s.parse::<u32>().ok())
+                            options.workers = std::str::from_utf8(value.as_ref()).ok().and_then(|s| s.parse::<u32>().ok())
                                 .ok_or("--workers must be an unsigned integer")? as usize;
                         }
                         _ => unreachable!(),
@@ -118,7 +120,11 @@ impl Options {
 // visible to its C string tokenizer; in NUL mode newlines are candidate bytes.
 fn read_candidates(delimiter: u8) -> io::Result<fz::Candidates> {
     let mut input = Vec::new();
-    io::stdin().lock().read_to_end(&mut input)?;
+    // A File reader uses the remaining file length as its allocation hint.
+    // This avoids geometric input growth when stdin is a redirected file,
+    // while pipes retain streaming reads. No buffered stdin reads precede it.
+    let mut source = std::fs::File::from(rustix::io::dup(rustix::stdio::stdin())?);
+    source.read_to_end(&mut input)?;
     Ok(fz::Candidates::from_input(input, delimiter))
 }
 

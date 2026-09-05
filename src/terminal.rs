@@ -10,10 +10,7 @@
 #[cfg(target_os = "linux")]
 use rustix::{
     event::{self, PollFd, PollFlags, Timespec},
-    io::Errno,
-    runtime::{
-        kernel_sigaction, KernelSigSet, KernelSigaction, KernelSigactionFlags, Signal,
-    },
+    io::{self as rustix_io, Errno},
 };
 #[cfg(target_os = "macos")]
 use rustix::{
@@ -23,14 +20,18 @@ use rustix::{
 use rustix::termios::{self, InputModes, LocalModes, OptionalActions, Termios};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
+#[cfg(target_os = "linux")]
+use std::marker::PhantomData;
 use std::mem;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::mem::MaybeUninit;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd};
 #[cfg(target_os = "macos")]
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::Path;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
 use std::time::Duration;
 
 #[cfg(not(all(
@@ -47,77 +48,165 @@ struct ResizeEvents {
 }
 
 #[cfg(target_os = "linux")]
-static WINCH_PENDING: AtomicBool = AtomicBool::new(false);
-
-#[cfg(target_os = "linux")]
-unsafe extern "C" fn note_winch(_: core::ffi::c_int) {
-    WINCH_PENDING.store(true, Ordering::Relaxed);
-}
-
-#[cfg(target_os = "linux")]
 struct ResizeEvents {
-    previous_winch_action: Option<KernelSigaction>,
+    signal_fd: OwnedFd,
+    // `pthread_sigmask` is thread-local. The thread that installs this
+    // descriptor must also restore this exact complete mask.
+    original_mask: Option<libc::sigset_t>,
+    // `sigset_t` itself is Send, but moving it would restore one thread's
+    // mask on another thread. Keep the whole Terminal on its opening thread.
+    _thread_bound: PhantomData<Rc<()>>,
 }
 
 #[cfg(target_os = "linux")]
 impl ResizeEvents {
     fn install(_: &File) -> io::Result<Self> {
-        WINCH_PENDING.store(false, Ordering::Relaxed);
-        let action = KernelSigaction {
-            sa_handler_kernel: Some(note_winch),
-            sa_flags: KernelSigactionFlags::empty(),
-            sa_restorer: None,
-            sa_mask: KernelSigSet::empty(),
+        let winch_mask = winch_mask()?;
+        // Some libc ABIs write only the kernel-sized prefix of sigset_t. Its
+        // all-zero representation is a valid empty mask, so pre-zero unused
+        // ABI storage before Rust later treats the full value as initialized.
+        let mut original_mask = MaybeUninit::<libc::sigset_t>::zeroed();
+        // SAFETY: `winch_mask` is initialized and `original_mask` is writable.
+        // pthread_sigmask returns its error number directly rather than errno.
+        let mask_result = unsafe {
+            libc::pthread_sigmask(libc::SIG_BLOCK, &winch_mask, original_mask.as_mut_ptr())
         };
-        // SAFETY: SIGWINCH is not reserved by libc, and this handler has the
-        // kernel's C ABI and only performs a lock-free relaxed atomic store.
-        // The complete prior action is retained and restored before release.
-        let previous_winch_action = unsafe { kernel_sigaction(Signal::WINCH, Some(action))? };
+        if mask_result != 0 {
+            return Err(io::Error::from_raw_os_error(mask_result));
+        }
+        // SAFETY: pthread_sigmask initialized the kernel-sized prefix; the
+        // zeroed remainder was already initialized as valid mask storage.
+        let original_mask = unsafe { original_mask.assume_init() };
+
+        // SIGWINCH remains blocked for this terminal's lifetime. A resize
+        // arriving while this descriptor is created or while poll starts is
+        // pending, so it makes this descriptor readable instead of racing a
+        // handler's check-before-poll window.
+        // SAFETY: -1 requests a new descriptor, `winch_mask` is initialized,
+        // and these are valid Linux signalfd flags.
+        let raw_fd = unsafe {
+            libc::signalfd(
+                -1,
+                &winch_mask,
+                libc::SFD_CLOEXEC | libc::SFD_NONBLOCK,
+            )
+        };
+        if raw_fd == -1 {
+            let signal_error = io::Error::last_os_error();
+            return match restore_signal_mask(&original_mask) {
+                Ok(()) => Err(signal_error),
+                Err(restore_error) => Err(restore_error),
+            };
+        }
+
+        // SAFETY: signalfd returned a newly owned nonnegative descriptor.
+        let signal_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
         Ok(Self {
-            previous_winch_action: Some(previous_winch_action),
+            signal_fd,
+            original_mask: Some(original_mask),
+            _thread_bound: PhantomData,
         })
     }
 
     fn wait_for_input(&self, input: &File, timeout: Option<Duration>) -> io::Result<Wait> {
-        if WINCH_PENDING.swap(false, Ordering::Relaxed) {
-            return Ok(Wait::Interrupted);
-        }
-
         let timeout = timeout.map(|timeout| {
             Timespec::try_from(timeout).expect("the fixed escape timeout fits in a timespec")
         });
-        let mut descriptors = [PollFd::new(input, PollFlags::IN)];
+        let mut descriptors = [
+            PollFd::new(input, PollFlags::IN),
+            PollFd::new(&self.signal_fd, PollFlags::IN),
+        ];
         match event::poll(&mut descriptors, timeout.as_ref()) {
-            Ok(0) => {
-                if WINCH_PENDING.swap(false, Ordering::Relaxed) {
-                    Ok(Wait::Interrupted)
-                } else {
-                    Ok(Wait::TimedOut)
-                }
-            }
-            Ok(_) if WINCH_PENDING.swap(false, Ordering::Relaxed) => Ok(Wait::Interrupted),
-            Ok(_) => Ok(Wait::Ready),
-            Err(Errno::INTR) => {
-                WINCH_PENDING.store(false, Ordering::Relaxed);
+            Ok(0) => Ok(Wait::TimedOut),
+            Ok(_) if descriptors[1].revents().contains(PollFlags::IN) => {
+                self.drain_signals()?;
+                // Input may be ready too. Redraw first; it stays readable for
+                // the next iteration, which preserves the resize transition.
                 Ok(Wait::Interrupted)
             }
+            Ok(_) if descriptors[1].revents().is_empty() => Ok(Wait::Ready),
+            Ok(_) => Err(io::Error::other("signalfd stopped reporting SIGWINCH")),
+            // Other signals can still interrupt poll. Redraw and retry, as
+            // the existing terminal loop did for an interrupted wait.
+            Err(Errno::INTR) => Ok(Wait::Interrupted),
             Err(error) => Err(error.into()),
         }
     }
 
-    fn restore(&mut self) -> io::Result<()> {
-        let Some(previous_winch_action) = self.previous_winch_action.take() else {
-            return Ok(());
-        };
-        // SAFETY: The action came directly from the kernel for SIGWINCH and
-        // is reinstalled unchanged. Retaining it on failure lets Drop retry.
-        match unsafe { kernel_sigaction(Signal::WINCH, Some(previous_winch_action.clone())) } {
-            Ok(_) => Ok(()),
-            Err(error) => {
-                self.previous_winch_action = Some(previous_winch_action);
-                Err(error.into())
+    fn drain_signals(&self) -> io::Result<()> {
+        // signalfd requires a buffer at least as large as this ABI-owned
+        // record. Its payload is intentionally unused: this descriptor only
+        // accepts SIGWINCH, and every queued record means redraw.
+        let mut record = [0_u8; mem::size_of::<libc::signalfd_siginfo>()];
+        loop {
+            match rustix_io::read(&self.signal_fd, &mut record) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "signalfd reached EOF",
+                    ));
+                }
+                Ok(bytes) if bytes == record.len() => {}
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "signalfd returned a partial signal record",
+                    ));
+                }
+                Err(Errno::INTR) => continue,
+                Err(Errno::AGAIN) => return Ok(()),
+                Err(error) => return Err(error.into()),
             }
         }
+    }
+
+    fn restore(&mut self) -> io::Result<()> {
+        let Some(original_mask) = self.original_mask.take() else {
+            return Ok(());
+        };
+        if let Err(error) = restore_signal_mask(&original_mask) {
+            // Retain it so Terminal::drop can retry after an explicit restore
+            // failure. The descriptor stays open until this field drops.
+            self.original_mask = Some(original_mask);
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ResizeEvents {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn winch_mask() -> io::Result<libc::sigset_t> {
+    // See install: a zero mask is valid and initializes ABI storage libc may
+    // not touch outside the kernel-sized signal-set prefix.
+    let mut mask = MaybeUninit::<libc::sigset_t>::zeroed();
+    // SAFETY: the libc functions initialize the supplied writable sigset_t,
+    // and SIGWINCH is a valid Linux signal number.
+    if unsafe { libc::sigemptyset(mask.as_mut_ptr()) } == -1
+        || unsafe { libc::sigaddset(mask.as_mut_ptr(), libc::SIGWINCH) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: zeroed storage was already initialized, and the libc calls set
+    // the mask's required kernel-visible bits.
+    Ok(unsafe { mask.assume_init() })
+}
+
+#[cfg(target_os = "linux")]
+fn restore_signal_mask(mask: &libc::sigset_t) -> io::Result<()> {
+    // SAFETY: `mask` was captured by pthread_sigmask for this same thread and
+    // restores its complete caller-owned signal mask.
+    let result = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, mask, std::ptr::null_mut()) };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
     }
 }
 
@@ -260,6 +349,9 @@ impl Terminal {
         let mut state = Editor::new(options.query.clone(), lines);
         let mut choices = fz::Choices::from_candidates(candidates);
         choices.set_workers(options.workers);
+        // On Linux, `Terminal::open` already blocked SIGWINCH. Any search
+        // workers spawned here inherit that mask, keeping resize delivery on
+        // this thread's signalfd for the whole interactive session.
         choices.search(&state.query);
 
         self.draw(&choices, options, &state)?;
@@ -443,7 +535,8 @@ impl Terminal {
             self.write_bytes(b"\n")?;
             self.clear_line()?;
             if let Some(candidate) = choices.get(index) {
-                self.draw_candidate(candidate, state, options.show_scores, index == selection)?;
+                let score = options.show_scores.then(|| choices.getscore(index).unwrap());
+                self.draw_candidate(candidate, state, score, index == selection)?;
             }
         }
 
@@ -461,11 +554,10 @@ impl Terminal {
         &mut self,
         candidate: &[u8],
         state: &Editor,
-        show_scores: bool,
+        score: Option<f64>,
         selected: bool,
     ) -> io::Result<()> {
-        if show_scores {
-            let score = fz::match_score(&state.query, candidate);
+        if let Some(score) = score {
             if score == f64::NEG_INFINITY {
                 self.write_bytes(b"(     ) ")?;
             } else {
@@ -803,4 +895,110 @@ fn next_boundary(bytes: &[u8], cursor: usize) -> usize {
         position += 1;
     }
     position
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::ResizeEvents;
+    use std::fs::File;
+    use std::io;
+    use std::mem::MaybeUninit;
+
+    struct RestoreMask(libc::sigset_t);
+
+    impl Drop for RestoreMask {
+        fn drop(&mut self) {
+            // The saved mask belongs to this test thread. Test cleanup must
+            // not leak its temporary signal state into the harness.
+            let _ = unsafe {
+                libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut())
+            };
+        }
+    }
+
+    fn current_mask() -> io::Result<libc::sigset_t> {
+        // libc may leave unused sigset_t storage untouched; a zero mask is a
+        // valid initial representation for that storage.
+        let mut mask = MaybeUninit::<libc::sigset_t>::zeroed();
+        let result = unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), mask.as_mut_ptr())
+        };
+        if result == 0 {
+            // SAFETY: pthread_sigmask filled its kernel-visible prefix and
+            // the zeroed remainder was already initialized.
+            Ok(unsafe { mask.assume_init() })
+        } else {
+            Err(io::Error::from_raw_os_error(result))
+        }
+    }
+
+    fn signal_set(signal: libc::c_int) -> io::Result<libc::sigset_t> {
+        let mut set = MaybeUninit::<libc::sigset_t>::zeroed();
+        if unsafe { libc::sigemptyset(set.as_mut_ptr()) } == -1
+            || unsafe { libc::sigaddset(set.as_mut_ptr(), signal) } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: zeroed storage is a valid empty mask, and libc updated its
+        // required signal-set prefix.
+        Ok(unsafe { set.assume_init() })
+    }
+
+    fn change_signal_mask(how: libc::c_int, signal: libc::c_int) -> io::Result<()> {
+        let set = signal_set(signal)?;
+        let result = unsafe { libc::pthread_sigmask(how, &set, std::ptr::null_mut()) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::from_raw_os_error(result))
+        }
+    }
+
+    fn is_blocked(mask: &libc::sigset_t, signal: libc::c_int) -> bool {
+        match unsafe { libc::sigismember(mask, signal) } {
+            0 => false,
+            1 => true,
+            _ => panic!("sigismember({signal}) failed: {}", io::Error::last_os_error()),
+        }
+    }
+
+    #[test]
+    fn resize_events_restore_blocked_and_unblocked_caller_masks() -> io::Result<()> {
+        let original = current_mask()?;
+        let _restore_original = RestoreMask(original);
+
+        // Preserve both legal caller states. A parent may already block
+        // SIGWINCH, while an unrelated blocked signal proves restoration uses
+        // the complete saved mask rather than only unblocking SIGWINCH.
+        change_signal_mask(libc::SIG_BLOCK, libc::SIGUSR1)?;
+        for caller_blocks_winch in [false, true] {
+            change_signal_mask(
+                if caller_blocks_winch {
+                    libc::SIG_BLOCK
+                } else {
+                    libc::SIG_UNBLOCK
+                },
+                libc::SIGWINCH,
+            )?;
+            let expected_after_restore = current_mask()?;
+
+            let input = File::open("/dev/null")?;
+            let mut events = ResizeEvents::install(&input)?;
+            let installed_mask = current_mask()?;
+            assert!(is_blocked(&installed_mask, libc::SIGWINCH));
+            assert!(is_blocked(&installed_mask, libc::SIGUSR1));
+
+            events.restore()?;
+            let restored_mask = current_mask()?;
+            assert_eq!(
+                is_blocked(&restored_mask, libc::SIGWINCH),
+                caller_blocks_winch
+            );
+            assert_eq!(
+                is_blocked(&restored_mask, libc::SIGUSR1),
+                is_blocked(&expected_after_restore, libc::SIGUSR1)
+            );
+        }
+        Ok(())
+    }
 }

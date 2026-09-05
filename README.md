@@ -15,9 +15,15 @@ printf 'src/main.rs\nsrc/lib.rs\n' | target/release/fz -e mr -s
 The checked-in `rust-toolchain.toml` selects the compiler. The normal release
 profile matches `~/d/e`: `opt-level = 3`, fat LTO, one codegen unit, aborting
 panics, and stripped symbols. It uses the prebuilt standard library.
+On macOS the linker omits unused dynamic libraries, avoiding an unused `iconv`
+load introduced by libc's declarations.
 
-Terminal access uses `rustix` with terminal, event, and runtime support. The
+Terminal access uses `rustix` with terminal and event support. Linux uses
+`libc` solely for signal masks and `signalfd`, preserving the caller's mask
+without installing a signal handler. The
 benchmark-only dependency is `rustybench`, including its allocation profiler.
+See [the benchmark guide](benches/README.md) for in-process allocation checks,
+release-process CPU and peak RSS comparisons, and completed terminal redraws.
 
 Options retain fzy's `-l`/`--lines`, `-p`/`--prompt`, `-q`/`--query`,
 `-e`/`--show-matches`, `-t`/`--tty`, `-s`/`--show-scores`, `-0`/`--read-null`,
@@ -71,7 +77,8 @@ The behavioral reference is upstream commit
 MIT licensed, copyright John Hawthorn; the notice is retained in `LICENSE`.
 
 Runtime compatibility is verified on macOS ARM64 with the pinned toolchain.
-Linux runtime behavior has not been verified here. The upstream checkout was
+Linux ARM64 is also tested in an Alpine container; Linux x86_64 runs under
+emulation. The upstream checkout was
 left untouched; its copied C suite passed all 32 tests.
 
 The initial core, CLI, and acceptance suites were confirmed failing before
@@ -79,3 +86,9 @@ production implementation. Three later terminal regressions (page endpoints,
 scroll margin, and info-row cleanup) were added after review fixes; their
 pre-fix behavior was subsequently checked in an isolated copy. The ARM scoring
 rounding regression was reproduced in a failing Rust test before its fix.
+Linux signal-mask restoration and the x86_64 resize failure were likewise
+confirmed failing before the `signalfd` fix. Score rounding follows the native
+reference builds: macOS Clang contracts the initial gap expression when FMA
+is available; Linux GCC with upstream's C99 flags rounds it twice. A Linux
+ordering regression covers that difference. Custom C compiler contraction
+flags can change upstream's ordering for scores separated by one ULP.

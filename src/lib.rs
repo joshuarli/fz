@@ -139,18 +139,55 @@ fn score_range(needle: &[u8], candidates: &Candidates, start: usize, end: usize,
 }
 
 /// Candidate bytes share one allocation. Adjacent offsets delimit records, so
-/// indexing costs one machine word per candidate, with no allocation per line.
+/// indexing costs four bytes per candidate for inputs up to 4 GiB minus one
+/// byte, or one machine word for larger inputs, with no allocation per line.
 /// Input records retain their separators; only the offset index is allocated.
 /// Runs of empty records are skipped when indexing and trimmed when borrowing.
 pub struct Candidates {
     bytes: Vec<u8>,
-    offsets: Vec<usize>,
+    offsets: CandidateOffsets,
     delimiter: Option<u8>,
+}
+
+// Most inputs fit in 4 GiB. Store their positions in four bytes, retaining
+// machine-sized offsets for larger inputs rather than imposing an input limit.
+enum CandidateOffsets {
+    Compact(Vec<u32>),
+    Wide(Vec<usize>),
+}
+
+impl CandidateOffsets {
+    fn push(&mut self, offset: usize) {
+        match self {
+            Self::Compact(offsets) => offsets.push(u32::try_from(offset).expect("compact input offset")),
+            Self::Wide(offsets) => offsets.push(offset),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self { Self::Compact(offsets) => offsets.len(), Self::Wide(offsets) => offsets.len() }
+    }
+
+    fn get(&self, index: usize) -> Option<usize> {
+        match self {
+            Self::Compact(offsets) => offsets.get(index).map(|&offset| offset as usize),
+            Self::Wide(offsets) => offsets.get(index).copied(),
+        }
+    }
+
+    fn shrink_to_fit(&mut self) {
+        match self { Self::Compact(offsets) => offsets.shrink_to_fit(), Self::Wide(offsets) => offsets.shrink_to_fit() }
+    }
 }
 
 impl Candidates {
     pub fn from_input(mut bytes: Vec<u8>, delimiter: u8) -> Self {
-        let mut offsets = Vec::with_capacity(bytes.len() / 48 + 1);
+        let capacity = bytes.len() / 48 + 1;
+        let mut offsets = if u32::try_from(bytes.len()).is_ok() {
+            CandidateOffsets::Compact(Vec::with_capacity(capacity))
+        } else {
+            CandidateOffsets::Wide(Vec::with_capacity(capacity))
+        };
         let mut start = 0;
         while start < bytes.len() {
             let end = start + score::find_either(&bytes[start..], delimiter, 0)
@@ -177,14 +214,14 @@ impl Candidates {
             bytes.extend_from_slice(&record);
         }
         offsets.push(bytes.len());
-        Self { bytes, offsets, delimiter: None }
+        Self { bytes, offsets: CandidateOffsets::Wide(offsets), delimiter: None }
     }
 
     pub fn len(&self) -> usize { self.offsets.len() - 1 }
     pub fn is_empty(&self) -> bool { self.len() == 0 }
     pub fn get(&self, index: usize) -> Option<&[u8]> {
-        let mut end = *self.offsets.get(index.checked_add(1)?)?;
-        let start = self.offsets[index];
+        let mut end = self.offsets.get(index.checked_add(1)?)?;
+        let start = self.offsets.get(index)?;
         if let Some(delimiter) = self.delimiter {
             while end > start && self.bytes[end - 1] == delimiter { end -= 1; }
         }

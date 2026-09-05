@@ -15,7 +15,9 @@ import dataclasses
 import fcntl
 import hashlib
 import json
+import math
 import os
+import platform
 import pty
 import selectors
 import signal
@@ -847,6 +849,84 @@ def interactive_report(
     return report
 
 
+def measured_value(value: object, label: str) -> Optional[float]:
+    """Return a finite reported measurement, leaving unavailable RSS unchecked."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BenchmarkError(f"{label} is not a numeric measurement")
+    result = float(value)
+    if not math.isfinite(result) or result < 0:
+        raise BenchmarkError(f"{label} is not a finite non-negative measurement")
+    return result
+
+
+def check_measurement_ratio(
+    violations: List[str], label: str, fz_value: object, fzy_value: object, maximum: float
+) -> None:
+    """Record a ratio violation only when both sides of a metric were measured."""
+
+    fz = measured_value(fz_value, f"fz {label}")
+    fzy = measured_value(fzy_value, f"fzy {label}")
+    if fz is None or fzy is None:
+        return
+    if fzy == 0:
+        raise BenchmarkError(f"fzy {label} is zero, so its ratio is undefined")
+    value = fz / fzy
+    if value > maximum:
+        violations.append(f"{label} is {value:.6g}x, exceeding {maximum:.6g}x")
+
+
+def check_report_ratio(report: Dict[str, object], maximum: float) -> None:
+    """Fail if a complete benchmark report exceeds an fz/fzy metric ratio.
+
+    Non-interactive rows have wall, child CPU, and wait4 peak-RSS measurements.
+    PTY rows have redraw latency plus post-redraw current and process-lifetime
+    peak RSS. Current RSS can be unavailable on unsupported hosts, so only a
+    pair of actual measurements is compared.
+    """
+
+    if not math.isfinite(maximum) or maximum <= 0:
+        raise BenchmarkError("ratio limit must be finite and greater than zero")
+    violations: List[str] = []
+    for row in report.get("noninteractive", []):
+        assert isinstance(row, dict)
+        label = f"{row['dataset']}/{row['query']}/{row['mode']}"
+        fz = row["fz"]
+        fzy = row["fzy"]
+        assert isinstance(fz, dict) and isinstance(fzy, dict)
+        for metric in ("wall_seconds", "cpu_seconds", "peak_rss_bytes"):
+            check_measurement_ratio(violations, f"{label} {metric}", fz[metric], fzy[metric], maximum)
+    for row in report.get("interactive", []):
+        assert isinstance(row, dict)
+        if "operation" in row:
+            label = f"interactive/{row['mode']}/{row['operation']} redraw_seconds"
+            check_measurement_ratio(
+                violations, label, row["fz_redraw_seconds"], row["fzy_redraw_seconds"], maximum
+            )
+        else:
+            label = f"interactive/{row['mode']}"
+            check_measurement_ratio(
+                violations, f"{label} rss_after_bytes", row["fz_rss_after_bytes"], row["fzy_rss_after_bytes"], maximum
+            )
+            check_measurement_ratio(
+                violations, f"{label} peak_rss_bytes", row["fz_peak_rss_bytes"], row["fzy_peak_rss_bytes"], maximum
+            )
+    if violations:
+        raise BenchmarkError("fz/fzy ratio check failed:\n  " + "\n  ".join(violations))
+
+
+def parse_ratio_limit(value: str) -> float:
+    try:
+        result = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a finite positive number") from error
+    if not math.isfinite(result) or result <= 0:
+        raise argparse.ArgumentTypeError("must be a finite positive number")
+    return result
+
+
 def parse_positive(value: str) -> int:
     result = int(value)
     if result < 1:
@@ -875,6 +955,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-interactive", action="store_true", help="skip PTY redraw and post-sequence memory workload")
     parser.add_argument("--interactive-only", action="store_true", help="only run the PTY workload")
     parser.add_argument("--json", type=Path, help="write summarized medians and raw process samples to this file")
+    parser.add_argument("--check-ratio", type=parse_ratio_limit, help="fail when any measured fz/fzy ratio exceeds this finite positive limit")
     return parser.parse_args()
 
 
@@ -914,10 +995,13 @@ def main() -> int:
         fixture_items.append(interactive_dataset)
     output: Dict[str, object] = {
         "schema": 1,
+        "timestamp_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "host": {"system": platform.system(), "release": platform.release(), "machine": platform.machine(), "cpus": os.cpu_count()},
         "warmups": warmups,
         "repetitions": repetitions,
         "fz": str(fz),
         "fzy": str(fzy),
+        "binary_sha256": {"fz": sha256_path(fz), "fzy": sha256_path(fzy)},
         "fixtures": [{"name": item.dataset.name, "sha256": item.sha256, "bytes": item.path.stat().st_size} for item in fixture_items],
     }
     terminal_expectations = None
@@ -949,6 +1033,9 @@ def main() -> int:
             "rss_after": {"/".join(key): values for key, values in rss_after.items()},
             "peak_samples": {"/".join(key): [dataclasses.asdict(sample) for sample in values] for key, values in peaks.items()},
         }
+    if options.check_ratio is not None:
+        check_report_ratio(output, options.check_ratio)
+        print(f"all measured fz/fzy ratios are at most {options.check_ratio:g}x")
     if options.json:
         options.json.parent.mkdir(parents=True, exist_ok=True)
         options.json.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n")

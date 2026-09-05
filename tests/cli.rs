@@ -27,6 +27,19 @@ fn filter_preserves_bytes_delimiters_and_stable_ties() {
 }
 
 #[test]
+fn filter_accepts_attached_short_and_long_values() {
+    for (args, expected) in [
+        (vec!["-efoo"], b"foo\n".as_slice()),
+        (vec!["--show-matches=bar"], b"bar\n".as_slice()),
+        (vec!["-sef"], b"0.890000\tfoo\n".as_slice()),
+    ] {
+        let result = run(&args, b"foo\nbar\n");
+        assert!(result.status.success(), "{args:?}: {:?}", result.stderr);
+        assert_eq!(result.stdout, expected, "{args:?}");
+    }
+}
+
+#[test]
 fn filter_formats_finite_and_infinite_scores_like_fzy() {
     let result = run(&["-se", "f"], b"f\nfoo\nbar\n");
     assert!(result.status.success());

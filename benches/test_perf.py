@@ -40,5 +40,58 @@ class InteractiveRenderTests(unittest.TestCase):
         self.assertTrue(screen.matches(expected))
 
 
+def ratio_report():
+    """A complete, synthetic report whose measured ratios equal 1.1."""
+
+    return {
+        "noninteractive": [
+            {
+                "dataset": "small",
+                "query": "exact",
+                "mode": "default",
+                "fz": {"wall_seconds": 1.1, "cpu_seconds": 1.1, "peak_rss_bytes": 110},
+                "fzy": {"wall_seconds": 1.0, "cpu_seconds": 1.0, "peak_rss_bytes": 100},
+            }
+        ],
+        "interactive": [
+            {
+                "mode": "default",
+                "operation": "dense",
+                "fz_redraw_seconds": 1.1,
+                "fzy_redraw_seconds": 1.0,
+            },
+            {
+                "mode": "default",
+                "fz_rss_after_bytes": 110,
+                "fzy_rss_after_bytes": 100,
+                "fz_peak_rss_bytes": 110,
+                "fzy_peak_rss_bytes": 100,
+            },
+        ],
+    }
+
+
+class RatioCheckTests(unittest.TestCase):
+    def test_boundary_ratio_passes(self):
+        perf.check_report_ratio(ratio_report(), 1.1)
+
+    def test_cpu_memory_and_latency_ratio_failures(self):
+        cases = (
+            ("cpu_seconds", "cpu_seconds"),
+            ("peak_rss_bytes", "peak_rss_bytes"),
+            ("fz_redraw_seconds", "redraw_seconds"),
+            ("fz_rss_after_bytes", "rss_after_bytes"),
+        )
+        for field, expected in cases:
+            with self.subTest(field=field):
+                report = ratio_report()
+                if field in report["noninteractive"][0]["fz"]:
+                    report["noninteractive"][0]["fz"][field] = 111
+                else:
+                    report["interactive"][0 if field == "fz_redraw_seconds" else 1][field] = 111
+                with self.assertRaisesRegex(perf.BenchmarkError, expected):
+                    perf.check_report_ratio(report, 1.1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

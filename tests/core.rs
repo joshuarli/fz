@@ -253,11 +253,18 @@ fn rank_of_an_empty_candidate_list_is_empty() {
 // The native upstream ARM build contracts the initial gap multiplication and
 // word bonus into an FMA. Rounding that twice changes ordering even though the
 // six-decimal printed scores are identical. Keep the smallest differential case.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[test]
 fn rank_preserves_native_fzy_rounding_for_nearly_equal_scores() {
     let values = candidates(&[b"_.e1cdaX230/YZ-b", b"b_.e1cdaX230/YZ-"]);
     assert_eq!(ranked_indices(&rank(b"Y-", &values)), vec![1, 0]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rank_preserves_gcc_fzy_rounding_for_nearly_equal_scores() {
+    let values = candidates(&[b"_.e1cdaX230/YZ-b", b"b_.e1cdaX230/YZ-"]);
+    assert_eq!(ranked_indices(&rank(b"Y-", &values)), vec![0, 1]);
 }
 
 #[test]
