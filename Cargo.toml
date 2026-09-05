@@ -1,0 +1,23 @@
+[package]
+name = "fz"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "A minimal fzy-compatible fuzzy selector"
+
+[dependencies]
+rustix = { version = "1.1.4", features = ["termios", "event", "runtime", "process"] }
+
+[dev-dependencies]
+rustybench = "0.1"
+
+[[bench]]
+name = "bench"
+harness = false
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

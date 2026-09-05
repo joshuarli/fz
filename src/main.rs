@@ -1,0 +1,179 @@
+use std::ffi::OsString;
+use std::io::{self, IsTerminal, Read, Write};
+use std::os::unix::ffi::OsStringExt;
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+mod terminal;
+
+struct Options {
+    lines: usize,
+    prompt: Vec<u8>,
+    query: Vec<u8>,
+    tty: PathBuf,
+    show_scores: bool,
+    show_info: bool,
+    filter: Option<Vec<u8>>,
+    delimiter: u8,
+    workers: usize,
+}
+
+const HELP: &str = "Usage: fz [OPTION]...
+ -l, --lines=LINES        Results to show (default 10; minimum 3; or max)
+ -p, --prompt=PROMPT      Input prompt (default '> ')
+ -q, --query=QUERY        Initial search string
+ -e, --show-matches=QUERY Output sorted matches without a terminal
+ -t, --tty=TTY            Terminal device (default /dev/tty)
+ -s, --show-scores        Show match scores
+ -0, --read-null          Read NUL-delimited candidates
+ -j, --workers=NUM        Maximum workers (default up to 4; small searches use 1)
+ -i, --show-info          Show match count
+ -h, --help              Display this help
+ -v, --version           Display version
+";
+
+impl Options {
+    fn parse() -> Result<Option<Self>, String> {
+        let mut options = Self {
+            lines: 10, prompt: b"> ".to_vec(), query: Vec::new(),
+            tty: PathBuf::from("/dev/tty"), show_scores: false, show_info: false,
+            filter: None, delimiter: b'\n', workers: 0,
+        };
+        let mut args = std::env::args_os().skip(1).map(OsString::into_vec);
+        while let Some(arg) = args.next() {
+            if arg == b"--" {
+                if args.next().is_some() { return Err("Unexpected positional argument".into()); }
+                break;
+            }
+            if !arg.starts_with(b"-") || arg == b"-" {
+                return Err("Unexpected positional argument".into());
+            }
+            let (keys, attached) = if let Some(long) = arg.strip_prefix(b"--") {
+                let end = long.iter().position(|&ch| ch == b'=').unwrap_or(long.len());
+                let key = match &long[..end] {
+                    b"lines" => b'l', b"prompt" => b'p', b"query" => b'q',
+                    b"show-matches" => b'e', b"tty" => b't', b"show-scores" => b's',
+                    b"read-null" => b'0', b"workers" => b'j', b"show-info" => b'i',
+                    b"help" => b'h', b"version" => b'v', _ => b'?',
+                };
+                (vec![key], (end < long.len()).then(|| long[end + 1..].to_vec()))
+            } else {
+                (arg[1..].to_vec(), None)
+            };
+            for (index, &key) in keys.iter().enumerate() {
+                if b"lpqetj".contains(&key) {
+                    let value = if let Some(value) = attached.clone() {
+                        value
+                    } else if index + 1 < keys.len() {
+                        keys[index + 1..].to_vec()
+                    } else if let Some(value) = args.next() {
+                        value
+                    } else {
+                        eprint!("{HELP}");
+                        return Ok(None);
+                    };
+                    match key {
+                        b'l' => {
+                            options.lines = if value == b"max" { usize::MAX } else {
+                                std::str::from_utf8(&value).ok().and_then(|s| s.parse().ok())
+                                    .filter(|&n| n >= 3).ok_or("--lines must be an integer >= 3 or max")?
+                            };
+                        }
+                        b'p' => options.prompt = value,
+                        b'q' => options.query = value,
+                        b'e' => options.filter = Some(value),
+                        b't' => options.tty = PathBuf::from(OsString::from_vec(value)),
+                        b'j' => {
+                            options.workers = std::str::from_utf8(&value).ok().and_then(|s| s.parse::<u32>().ok())
+                                .ok_or("--workers must be an unsigned integer")? as usize;
+                        }
+                        _ => unreachable!(),
+                    }
+                    break;
+                }
+                if attached.is_some() {
+                    eprint!("{HELP}");
+                    return Ok(None);
+                }
+                match key {
+                    b's' => options.show_scores = true,
+                    b'0' => options.delimiter = 0,
+                    b'i' => options.show_info = true,
+                    b'v' => {
+                        println!("fz {} (fzy port; © 2014-2025 John Hawthorn)", env!("CARGO_PKG_VERSION"));
+                        return Ok(None);
+                    }
+                    _ => {
+                        eprint!("{HELP}");
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        Ok(Some(options))
+    }
+}
+
+// fzy skips empty records. In newline mode the first NUL terminates the input
+// visible to its C string tokenizer; in NUL mode newlines are candidate bytes.
+fn read_candidates(delimiter: u8) -> io::Result<fz::Candidates> {
+    let mut input = Vec::new();
+    io::stdin().lock().read_to_end(&mut input)?;
+    Ok(fz::Candidates::from_input(input, delimiter))
+}
+
+fn run(options: Options) -> io::Result<bool> {
+    if let Some(query) = &options.filter {
+        let mut choices = fz::Choices::from_candidates(read_candidates(options.delimiter)?);
+        choices.set_workers(options.workers);
+        choices.search(query);
+        let mut output = io::BufWriter::new(io::stdout().lock());
+        for index in 0..choices.available() {
+            if options.show_scores { write!(output, "{:.6}\t", choices.getscore(index).unwrap())?; }
+            output.write_all(choices.get(index).unwrap())?;
+            output.write_all(b"\n")?;
+        }
+        output.flush()?;
+        return Ok(true);
+    }
+
+    // Set terminal input mode before consuming a pipe so early keystrokes are
+    // queued without canonical editing or CR-to-NL translation. When stdin is
+    // itself a terminal, retain canonical input until its candidate EOF.
+    let (mut terminal, candidates) = if io::stdin().is_terminal() {
+        let candidates = read_candidates(options.delimiter)?;
+        (terminal::Terminal::open(&options.tty)?, candidates)
+    } else {
+        let terminal = terminal::Terminal::open(&options.tty)?;
+        (terminal, read_candidates(options.delimiter)?)
+    };
+    let selection = terminal.run(candidates, &options)?;
+    drop(terminal);
+    if let Some(selection) = selection {
+        let mut output = io::stdout().lock();
+        output.write_all(&selection)?;
+        output.write_all(b"\n")?;
+        output.flush()?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+fn main() -> ExitCode {
+    match Options::parse() {
+        Ok(None) => ExitCode::SUCCESS,
+        Ok(Some(options)) => match run(options) {
+            Ok(true) => ExitCode::SUCCESS,
+            Ok(false) => ExitCode::FAILURE,
+            Err(error) => {
+                eprintln!("fz: {error}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) => {
+            eprintln!("fz: {error}\n{HELP}");
+            ExitCode::FAILURE
+        }
+    }
+}

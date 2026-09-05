@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""Regression tests for the process/terminal benchmark harness itself."""
+
+import importlib.util
+from pathlib import Path
+import sys
+import unittest
+
+
+PERF_PATH = Path(__file__).with_name("perf.py")
+SPEC = importlib.util.spec_from_file_location("fz_perf", PERF_PATH)
+assert SPEC is not None and SPEC.loader is not None
+perf = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = perf
+SPEC.loader.exec_module(perf)
+
+
+def row(text, columns=80):
+    return list(text.ljust(columns))
+
+
+class InteractiveRenderTests(unittest.TestCase):
+    def test_new_prompt_with_old_rows_is_not_a_completed_search(self):
+        """fzy draws input bytes before it computes the batch's new results."""
+
+        screen = perf.Screen(rows=6, cols=80)
+        screen.cells[0] = row("> old")
+        screen.cells[1] = row("[2/2]")
+        screen.cells[2] = row("old-first")
+        screen.cells[3] = row("old-second")
+        expected = perf.TerminalExpectation("fresh", 1, 2, ("fresh-first",))
+
+        # This is the stale fzy state: it has already echoed the full query,
+        # while its info and result rows still describe the previous search.
+        screen.feed(b"\x1b[1G> fresh\x1b[K")
+        self.assertFalse(screen.matches(expected))
+
+        # Only the subsequent score-and-redraw pass may complete the sample.
+        screen.feed(b"\x1b[1G> fresh\x1b[K\r\n[1/2]\x1b[K\r\nfresh-first\x1b[K\r\n\x1b[K\r\n\x1b[K")
+        self.assertTrue(screen.matches(expected))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
