@@ -83,8 +83,6 @@ struct Score {
     best: f64,
 }
 
-const NO_SCORE: Score = Score { ending: f64::NEG_INFINITY, best: f64::NEG_INFINITY };
-
 #[inline]
 fn lowercase(byte: u8) -> u8 { byte.to_ascii_lowercase() }
 
@@ -101,7 +99,8 @@ fn initial_score(column: usize, bonus: f64) -> f64 {
 /// folded and their bonus is encoded once, while the fixed fzy-sized rows are
 /// initialized only once per search.
 pub(crate) struct ScoreWorkspace {
-    row: [Score; MATCH_MAX_LEN],
+    ending: [f64; MATCH_MAX_LEN],
+    best: [f64; MATCH_MAX_LEN],
     lowercase_haystack: [u8; MATCH_MAX_LEN],
     bonus_codes: [u8; MATCH_MAX_LEN],
 }
@@ -109,7 +108,8 @@ pub(crate) struct ScoreWorkspace {
 impl ScoreWorkspace {
     pub(crate) fn new() -> Self {
         Self {
-            row: [NO_SCORE; MATCH_MAX_LEN],
+            ending: [f64::NEG_INFINITY; MATCH_MAX_LEN],
+            best: [f64::NEG_INFINITY; MATCH_MAX_LEN],
             lowercase_haystack: [0; MATCH_MAX_LEN],
             bonus_codes: [BONUS_NONE; MATCH_MAX_LEN],
         }
@@ -160,31 +160,34 @@ fn score_rows(
             f64::NEG_INFINITY
         };
         best = ending.max(best + first_gap);
-        let cell = Score { ending, best };
-        workspace.row[j] = cell;
-        record(cell, false);
+        workspace.ending[j] = ending;
+        workspace.best[j] = best;
+        record(Score { ending, best }, false);
     }
 
     for i in 1..needle.len() {
         let gap = if i + 1 == needle.len() { GAP_TRAILING } else { GAP_INNER };
         let byte = lowercase(needle[i]);
-        let mut diagonal = NO_SCORE;
+        let mut diagonal_ending = f64::NEG_INFINITY;
+        let mut diagonal_best = f64::NEG_INFINITY;
         let mut best = f64::NEG_INFINITY;
         for j in 0..width {
-            let previous = workspace.row[j];
+            let previous_ending = workspace.ending[j];
+            let previous_best = workspace.best[j];
             let ending = if byte == workspace.lowercase_haystack[j] && j > 0 {
-                (diagonal.best + bonus_score(workspace.bonus_codes[j])).max(diagonal.ending + CONSECUTIVE)
+                (diagonal_best + bonus_score(workspace.bonus_codes[j])).max(diagonal_ending + CONSECUTIVE)
             } else {
                 f64::NEG_INFINITY
             };
             best = ending.max(best + gap);
-            let cell = Score { ending, best };
-            workspace.row[j] = cell;
-            record(cell, j > 0 && best == diagonal.ending + CONSECUTIVE);
-            diagonal = previous;
+            workspace.ending[j] = ending;
+            workspace.best[j] = best;
+            record(Score { ending, best }, j > 0 && best == diagonal_ending + CONSECUTIVE);
+            diagonal_ending = previous_ending;
+            diagonal_best = previous_best;
         }
     }
-    workspace.row[width - 1].best
+    workspace.best[width - 1]
 }
 
 /// Optimal fzy score. Empty queries, nonmatches, and candidates over 1024 bytes
