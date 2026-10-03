@@ -17,6 +17,16 @@ pub fn rank(needle: &[u8], candidates: &[Vec<u8>]) -> Vec<(usize, f64)> {
     results
 }
 
+fn by_rank(a: &(usize, f64), b: &(usize, f64)) -> std::cmp::Ordering {
+    b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0))
+}
+
+/// Results ranked on first use. The first `ranked` entries of `results` are in
+/// final order and every later entry ranks after them. A screen shows a few
+/// rows, so ranking only those costs a linear selection instead of sorting
+/// every match. Accessors take `&mut self` because reading a row can extend
+/// the ranked prefix.
+///
 /// A search resets selection to the first result. Before the first search, no
 /// result is available. Navigation wraps, and empty results retain index zero.
 pub struct Choices {
@@ -25,8 +35,17 @@ pub struct Choices {
     query: Vec<u8>,
     workers: usize,
     results: Vec<(usize, f64)>,
+    ranked: usize,
     selection: usize,
 }
+
+// Smallest prefix ranked at once, enough for a full screen plus paging.
+const MIN_RANKED: usize = 64;
+
+// Candidate bytes times query bytes at which spawning workers pays for itself.
+// Measured on 100k short records: 2,000,000 left searches serial that finish
+// about a millisecond sooner when split, while 200,000 was no better than 600,000.
+const PARALLEL_WORK: usize = 600_000;
 
 impl Choices {
     pub fn new(candidates: Vec<Vec<u8>>) -> Self {
@@ -34,7 +53,7 @@ impl Choices {
     }
 
     pub fn from_candidates(candidates: Candidates) -> Self {
-        Self { candidates, results: Vec::new(), selection: 0, all: false, query: Vec::new(), workers: 1 }
+        Self { candidates, results: Vec::new(), ranked: 0, selection: 0, all: false, query: Vec::new(), workers: 1 }
     }
 
     /// Set a worker ceiling. Zero uses available CPUs; at most four workers
@@ -47,6 +66,7 @@ impl Choices {
 
     pub fn search(&mut self, needle: &[u8]) {
         self.selection = 0;
+        self.ranked = 0;
         let refine = !self.query.is_empty() && needle.starts_with(&self.query);
         self.query.clear();
         self.query.extend_from_slice(needle);
@@ -71,7 +91,7 @@ impl Choices {
             // allocator pages and inflates peak RSS even after realloc frees them.
             self.results.reserve_exact(self.candidates.len());
             let work = self.candidates.bytes.len().saturating_mul(needle.len());
-            if self.workers > 1 && self.candidates.len() >= 4096 && work >= 2_000_000 {
+            if self.workers > 1 && self.candidates.len() >= 4096 && work >= PARALLEL_WORK {
                 let chunk = self.candidates.len().div_ceil(self.workers);
                 // Workers read disjoint candidate ranges and own only their
                 // share of the result capacity, unlike fzy's N-sized per-worker
@@ -94,7 +114,31 @@ impl Choices {
                 score_range(needle, &self.candidates, 0, self.candidates.len(), &mut self.results);
             }
         }
-        self.results.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    }
+
+    /// Rank every result now. Cheaper than reading rows one at a time when
+    /// all of them are needed, as when printing the whole list.
+    pub fn rank_all(&mut self) {
+        self.rank_through(usize::MAX);
+    }
+
+    // Grows the prefix at least fourfold so paging stays near-linear overall,
+    // and sorts outright once the prefix would cover a quarter of the results.
+    fn rank_through(&mut self, count: usize) {
+        let len = self.results.len();
+        let count = count.min(len);
+        if count <= self.ranked { return; }
+        let target = count.max(self.ranked.saturating_mul(4)).max(MIN_RANKED).min(len);
+        let tail = &mut self.results[self.ranked..];
+        if target >= len.div_ceil(4) {
+            tail.sort_unstable_by(by_rank);
+            self.ranked = len;
+        } else {
+            let prefix = target - self.ranked;
+            tail.select_nth_unstable_by(prefix - 1, by_rank);
+            tail[..prefix].sort_unstable_by(by_rank);
+            self.ranked = target;
+        }
     }
 
     pub fn next(&mut self) {
@@ -109,17 +153,23 @@ impl Choices {
         }
     }
 
-    pub fn get(&self, index: usize) -> Option<&[u8]> {
-        let candidate = if self.all { index } else { self.results.get(index)?.0 };
+    pub fn get(&mut self, index: usize) -> Option<&[u8]> {
+        let candidate = if self.all { index } else {
+            if index >= self.results.len() { return None; }
+            self.rank_through(index + 1);
+            self.results[index].0
+        };
         self.candidates.get(candidate)
     }
 
-    pub fn getscore(&self, index: usize) -> Option<f64> {
-        if self.all { (index < self.candidates.len()).then_some(f64::NEG_INFINITY) }
-        else { self.results.get(index).map(|&(_, score)| score) }
+    pub fn getscore(&mut self, index: usize) -> Option<f64> {
+        if self.all { return (index < self.candidates.len()).then_some(f64::NEG_INFINITY); }
+        if index >= self.results.len() { return None; }
+        self.rank_through(index + 1);
+        Some(self.results[index].1)
     }
 
-    pub fn selected(&self) -> Option<&[u8]> { self.get(self.selection) }
+    pub fn selected(&mut self) -> Option<&[u8]> { self.get(self.selection) }
     pub fn len(&self) -> usize { self.candidates.len() }
     pub fn is_empty(&self) -> bool { self.candidates.is_empty() }
     pub fn available(&self) -> usize { if self.all { self.candidates.len() } else { self.results.len() } }

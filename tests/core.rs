@@ -360,7 +360,7 @@ fn choices_filters_sorts_and_wraps_navigation() {
 
 #[test]
 fn choices_have_no_results_before_a_search() {
-    let choices = Choices::new(candidates(&[b"test"]));
+    let mut choices = Choices::new(candidates(&[b"test"]));
 
     assert_eq!(choices.available(), 0);
     assert_eq!(choices.selection(), 0);
@@ -524,6 +524,40 @@ fn property_positions_are_increasing_and_identify_the_eligible_bytes() {
         }
         for (needle_byte, position) in needle.iter().zip(positions) {
             assert!(needle_byte.eq_ignore_ascii_case(&haystack[position]));
+        }
+    }
+}
+
+#[test]
+fn lazily_ranked_rows_match_a_full_ranking_in_any_read_order() {
+    // Far more matches than the initial ranked prefix, with many tied scores,
+    // so scattered reads cross selection, partial sorts, and the full-sort cutover.
+    let records: Vec<Vec<u8>> = (0..2000)
+        .map(|i| format!("{}/{}{}", i % 7, ["a", "ba", "xab"][i % 3], i % 50).into_bytes())
+        .collect();
+    let expected = fz::rank(b"a", &records);
+    assert!(expected.len() > 1000);
+
+    let mut state = 0x853c_49e6_748f_ea9b_u64;
+    let mut reads: Vec<usize> = (0..300)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize % (expected.len() + 5)
+        })
+        .collect();
+    reads.extend([0, 1, 63, 64, 65, expected.len() - 1, expected.len()]);
+
+    let mut choices = Choices::new(records.clone());
+    choices.search(b"a");
+    for index in reads {
+        match expected.get(index) {
+            Some(&(record, score)) => {
+                assert_eq!(choices.getscore(index), Some(score), "score at {index}");
+                assert_eq!(choices.get(index), Some(records[record].as_slice()), "row {index}");
+            }
+            None => assert_eq!(choices.get(index), None),
         }
     }
 }

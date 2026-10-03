@@ -354,7 +354,7 @@ impl Terminal {
         // this thread's signalfd for the whole interactive session.
         choices.search(&state.query);
 
-        self.draw(&choices, options, &state)?;
+        self.draw(&mut choices, options, &state)?;
         let mut input_ready = false;
         loop {
             // Only a bare Escape is ambiguous. Other partial key sequences
@@ -367,7 +367,7 @@ impl Terminal {
             let byte = match ready {
                 Wait::Ready => Some(self.read_byte()?.ok_or(io::ErrorKind::UnexpectedEof)?),
                 Wait::Interrupted => {
-                    self.draw(&choices, options, &state)?;
+                    self.draw(&mut choices, options, &state)?;
                     continue;
                 }
                 Wait::TimedOut => None,
@@ -376,7 +376,7 @@ impl Terminal {
                 InputResult::Continue { search_changed } => {
                     state.search_dirty |= search_changed;
                 }
-                InputResult::Accept => return self.finish(&mut state, &choices, options.show_info),
+                InputResult::Accept => return self.finish(&mut state, &mut choices, options.show_info),
                 InputResult::Cancel => return self.cancel(&state, options.show_info),
             }
             // Drain already queued typing before ranking and drawing. fzy also
@@ -387,14 +387,14 @@ impl Terminal {
                 continue;
             }
             state.update_choices(&mut choices);
-            self.draw(&choices, options, &state)?;
+            self.draw(&mut choices, options, &state)?;
         }
     }
 
     fn finish(
         &mut self,
         state: &mut Editor,
-        choices: &fz::Choices,
+        choices: &mut fz::Choices,
         show_info: bool,
     ) -> io::Result<Option<Vec<u8>>> {
         let selection = choices
@@ -502,7 +502,7 @@ impl Terminal {
 
     fn draw(
         &mut self,
-        choices: &fz::Choices,
+        choices: &mut fz::Choices,
         options: &crate::Options,
         state: &Editor,
     ) -> io::Result<()> {
@@ -533,8 +533,8 @@ impl Terminal {
         for index in start..start.saturating_add(state.lines) {
             self.write_bytes(b"\n")?;
             self.clear_line()?;
+            let score = options.show_scores.then(|| choices.getscore(index)).flatten();
             if let Some(candidate) = choices.get(index) {
-                let score = options.show_scores.then(|| choices.getscore(index).unwrap());
                 self.draw_candidate(candidate, state, score, index == selection)?;
             }
         }

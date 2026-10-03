@@ -1,9 +1,17 @@
+// Rust's runtime start-up (SIGPIPE override, stack-guard handler install, main
+// thread bookkeeping) costs about half a millisecond per process, which is most
+// of what separates fz from a C binary on small inputs. fz needs none of it:
+// SIGPIPE keeps its default disposition as in fzy, and `run` flushes its own
+// output because nothing flushes stdout at exit.
+#![cfg_attr(not(test), no_main)]
+
 use std::borrow::Cow;
-use std::ffi::OsString;
+#[cfg(not(test))]
+use std::ffi::c_char;
+use std::ffi::{c_int, OsString};
 use std::io::{self, IsTerminal, Read, Write};
 use std::os::unix::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
 
 mod terminal;
 
@@ -133,6 +141,7 @@ fn run(options: Options) -> io::Result<bool> {
         let mut choices = fz::Choices::from_candidates(read_candidates(options.delimiter)?);
         choices.set_workers(options.workers);
         choices.search(query);
+        choices.rank_all();
         let mut output = io::BufWriter::new(io::stdout().lock());
         for index in 0..choices.available() {
             if options.show_scores { write!(output, "{:.6}\t", choices.getscore(index).unwrap())?; }
@@ -166,20 +175,27 @@ fn run(options: Options) -> io::Result<bool> {
     }
 }
 
-fn main() -> ExitCode {
+#[cfg(not(test))]
+#[unsafe(no_mangle)]
+pub extern "C" fn main(_argc: c_int, _argv: *const *const c_char) -> c_int {
+    cli()
+}
+
+#[cfg_attr(test, allow(dead_code))]
+fn cli() -> c_int {
     match Options::parse() {
-        Ok(None) => ExitCode::SUCCESS,
+        Ok(None) => 0,
         Ok(Some(options)) => match run(options) {
-            Ok(true) => ExitCode::SUCCESS,
-            Ok(false) => ExitCode::FAILURE,
+            Ok(true) => 0,
+            Ok(false) => 1,
             Err(error) => {
                 eprintln!("fz: {error}");
-                ExitCode::FAILURE
+                1
             }
         },
         Err(error) => {
             eprintln!("fz: {error}\n{HELP}");
-            ExitCode::FAILURE
+            1
         }
     }
 }
