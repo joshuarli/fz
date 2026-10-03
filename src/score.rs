@@ -242,9 +242,7 @@ pub fn match_positions(needle: &[u8], haystack: &[u8]) -> Option<Vec<usize>> {
     let mut workspace = ScoreWorkspace::new();
     let mut trace = Vec::with_capacity(needle.len() * width);
     let score = score_rows(&mut workspace, needle, haystack, |cell, consecutive| {
-        let flags = (cell.ending != f64::NEG_INFINITY) as u8 * ENDING
-            | (cell.ending == cell.best) as u8 * BEST
-            | consecutive as u8 * CONSECUTIVE_PATH;
+        let flags = ((cell.ending != f64::NEG_INFINITY) as u8 * ENDING) | ((cell.ending == cell.best) as u8 * BEST) | (consecutive as u8 * CONSECUTIVE_PATH);
         trace.push(flags);
     });
     if score == f64::NEG_INFINITY {

@@ -4,9 +4,7 @@ pub use score::{has_match, match_score, match_positions};
 fn rank_into(needle: &[u8], candidates: &[Vec<u8>], results: &mut Vec<(usize, f64)>) {
     results.clear();
     let mut scorer = score::ScoreWorkspace::new();
-    results.extend(candidates.iter().enumerate().filter_map(|(index, candidate)| {
-        has_match(needle, candidate).then(|| (index, scorer.score(needle, candidate)))
-    }));
+    results.extend(candidates.iter().enumerate().filter(|&(_index, candidate)| has_match(needle, candidate)).map(|(index, candidate)| (index, scorer.score(needle, candidate))));
     // Index makes ties deterministic without allocating a stable-sort buffer.
     results.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
 }

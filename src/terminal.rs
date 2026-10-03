@@ -434,12 +434,11 @@ impl Terminal {
             }
         }
 
-        if let Some(action) = matching_action {
-            if !in_middle || resolve_ambiguous_key {
+        if let Some(action) = matching_action
+            && (!in_middle || resolve_ambiguous_key) {
                 state.input.clear();
                 return self.apply_action(action, state, choices);
             }
-        }
 
         if matching_action.is_some() && in_middle {
             state.ambiguous_key_pending = true;
